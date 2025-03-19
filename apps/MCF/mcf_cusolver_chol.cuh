@@ -6,6 +6,9 @@
 
 #include "mcf_kernels.cuh"
 
+#include <Eigen/Sparse>
+#include <unsupported/Eigen/SparseExtra>
+
 template <typename T, uint32_t blockThreads>
 __global__ static void mcf_B_setup(const rxmesh::Context            context,
                                    const rxmesh::VertexAttribute<T> coords,
@@ -132,6 +135,7 @@ __global__ static void mcf_A_setup(
         !use_uniform_laplace);
 }
 
+
 template <typename T>
 void mcf_cusolver_chol(rxmesh::RXMeshStatic& rx,
                        rxmesh::PermuteMethod permute_method)
@@ -183,15 +187,33 @@ void mcf_cusolver_chol(rxmesh::RXMeshStatic& rx,
 
 
     // To Use LU, we have to move the data to the host
-    // A_mat.move(DEVICE, HOST);
-    // B_mat.move(DEVICE, HOST);
-    // X_mat->move(DEVICE, HOST);
+    // RXMESH_INFO("Writing matrices to file");
+
+    // Creating .mtx files for A, B in a directory under the object's file name
+    A_mat.move(DEVICE, HOST);
+    B_mat.move(DEVICE, HOST);
+
+    std::string file_name = extract_file_name(Arg.obj_file_name);
+    std::string output_dir =  Arg.output_folder + file_name;
+
+    int status = mkdir(output_dir.c_str(), 0777); 
+    if (status == 0) {
+        printf("Directory created successfully\n");
+    } else {
+        printf("Directory already exists");
+    }
+
+    auto A_mat_copy = A_mat.to_eigen();
+    auto B_mat_copy = B_mat.to_eigen();
+
+    Eigen::saveMarket(A_mat_copy, output_dir + "/A.mtx");
+    Eigen::saveMarketDense(B_mat_copy, output_dir + "/B.mtx");
+
     // A_mat.solve(B_mat, *X_mat, Solver::LU, permute_method);
 
     // Solving using QR or CHOL
     // A_mat.solve(B_mat, *X_mat, Solver::QR, permute_method);
     // A_mat.solve(B_mat, *X_mat, Solver::CHOL, permute_method);
-
 
     // pre-solve
     // A_mat.pre_solve(rx, Solver::CHOL, permute_method);
@@ -303,6 +325,10 @@ void mcf_cusolver_chol(rxmesh::RXMeshStatic& rx,
     // device to the host
     // X_mat->move(rxmesh::DEVICE, rxmesh::HOST);
 
+    // Creating .mtx file for the solution matrix
+    X_mat->move(DEVICE, HOST);
+    auto X_mat_copy = X_mat->to_eigen();
+    Eigen::saveMarketDense(X_mat_copy, output_dir + "/X.mtx");
     // copy the results to attributes
     // coords->from_matrix(X_mat.get());
 
