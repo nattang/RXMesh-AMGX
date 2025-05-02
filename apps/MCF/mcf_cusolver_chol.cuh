@@ -135,6 +135,46 @@ __global__ static void mcf_A_setup(
         !use_uniform_laplace);
 }
 
+template<typename MatrixType>
+void saveSymmetricMarket(
+    const MatrixType& A,
+    const std::string& filename)
+{
+    std::ofstream out(filename);
+    if(!out) throw std::runtime_error("Could not open " + filename);
+
+    out << "%%MatrixMarket matrix coordinate real symmetric\n";
+
+    const int m = A.rows();
+    const int n = A.cols();
+    if (m != n) throw std::runtime_error("Matrix must be square");
+
+    size_t nnz = 0;
+    for (int k = 0; k < A.outerSize(); ++k)
+    {
+        for (typename MatrixType::InnerIterator it(A, k); it; ++it)
+        {
+            if (it.row() <= it.col()) ++nnz;
+        }
+    }
+
+    out << m << " " << n << " " << nnz << "\n";
+    // because this is a symmetric matrix, only store upper half
+    out << std::scientific << std::setprecision(6);
+    for (int k = 0; k < A.outerSize(); ++k)
+    {
+        for (typename MatrixType::InnerIterator it(A, k); it; ++it)
+        {
+            int i = it.row();
+            int j = it.col();
+            double v = it.value();
+            if (i <= j)
+            {
+                out << (i+1) << " " << (j+1) << " " << v << "\n";
+            }
+        }
+    }
+}
 
 template <typename T>
 void mcf_cusolver_chol(rxmesh::RXMeshStatic& rx,
@@ -193,6 +233,8 @@ void mcf_cusolver_chol(rxmesh::RXMeshStatic& rx,
     A_mat.move(DEVICE, HOST);
     B_mat.move(DEVICE, HOST);
 
+    printf("Non zeros: %d\n", A_mat.non_zeros());
+
     std::string file_name = extract_file_name(Arg.obj_file_name);
     std::string output_dir =  Arg.output_folder + file_name;
 
@@ -208,6 +250,8 @@ void mcf_cusolver_chol(rxmesh::RXMeshStatic& rx,
 
     Eigen::saveMarket(A_mat_copy, output_dir + "/A.mtx");
     Eigen::saveMarketDense(B_mat_copy, output_dir + "/B.mtx");
+
+    saveSymmetricMarket(A_mat_copy, output_dir + "/A_sym.mtx");
 
     // A_mat.solve(B_mat, *X_mat, Solver::LU, permute_method);
 
