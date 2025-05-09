@@ -101,6 +101,7 @@ static std::string layout_to_string(const layoutT layout)
  */
 enum class Op
 {
+    INVALID   = -1,
     V         = 0,
     E         = 1,
     F         = 2,
@@ -115,6 +116,64 @@ enum class Op
     EF        = 11,
     EVDiamond = 12,
 };
+
+/**
+ * @brief define the transpose of a give query operation
+ */
+static Op transpose_op(Op op)
+{
+    if (op == Op::V) {
+        return Op::V;
+    }
+
+    if (op == Op::E) {
+        return Op::E;
+    }
+
+    if (op == Op::F) {
+        return Op::F;
+    }
+
+    if (op == Op::VV) {
+        return Op::VV;
+    }
+
+    if (op == Op::VE) {
+        return Op::EV;
+    }
+
+    if (op == Op::VF) {
+        return Op::FV;
+    }
+
+    if (op == Op::FV) {
+        return Op::VF;
+    }
+
+    if (op == Op::FE) {
+        return Op::EF;
+    }
+
+    if (op == Op::FF) {
+        return Op::FF;
+    }
+
+    if (op == Op::EV) {
+        return Op::VE;
+    }
+
+    if (op == Op::EE) {
+        return Op::EE;
+    }
+
+    if (op == Op::EF) {
+        return Op::FE;
+    }
+
+    if (op == Op::EVDiamond) {
+        return Op::INVALID;
+    }
+}
 
 /**
  * @brief defines how we create a cavity. The first element is the source and

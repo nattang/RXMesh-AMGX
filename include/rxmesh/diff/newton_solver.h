@@ -4,33 +4,51 @@
 
 #include "rxmesh/diff/armijo_condition.h"
 
+#include "rxmesh/matrix/cg_mat_free_solver.h"
+#include "rxmesh/matrix/cg_solver.h"
+#include "rxmesh/matrix/cholesky_solver.h"
+#include "rxmesh/matrix/lu_solver.h"
+#include "rxmesh/matrix/pcg_solver.h"
+#include "rxmesh/matrix/qr_solver.h"
+
 namespace rxmesh {
 
-template <typename T, int VariableDim, typename ObjHandleT>
+template <typename T, int VariableDim, typename ObjHandleT, typename SolverT>
 struct NetwtonSolver
 {
-    DiffScalarProblem<T, VariableDim, ObjHandleT>& problem;
-    DenseMatrix<T, Eigen::RowMajor>                dir;
-    std::shared_ptr<Attribute<T, ObjHandleT>>      temp_objective;
-    Solver                                         solver;
 
+    using DiffProblemT = DiffScalarProblem<T, VariableDim, ObjHandleT, true>;
+    using HessMatT     = typename DiffProblemT::HessMatT;
+    using DenseMatT    = typename DiffProblemT::DenseMatT;
+
+    DiffProblemT&                             problem;
+    DenseMatT                                 dir;
+    std::shared_ptr<Attribute<T, ObjHandleT>> temp_objective;
+    SolverT*                                  solver;
+
+    float solve_time;
 
     /**
-     * @brief
+     * @brief Newton solver
      */
-    NetwtonSolver(DiffScalarProblem<T, VariableDim, ObjHandleT>& p, Solver s)
+    NetwtonSolver(DiffProblemT& p, SolverT* s)
         : problem(p),
-          dir(DenseMatrix<T, Eigen::RowMajor>(p.rx,
-                                              p.grad.rows(),
-                                              p.grad.cols())),
+          dir(DenseMatT(p.rx, p.grad.rows(), p.grad.cols())),
           temp_objective(
               p.rx.add_attribute_like("temp_objective", *p.objective)),
-          solver(s)
+          solver(s),
+          solve_time(0)
     {
-        // TODO
-        // hess.pre_solve(rx, Solver::CHOL);
-
         dir.reset(0, LOCATION_ALL);
+
+        if constexpr (std::is_base_of_v<CGMatFreeSolver<T, DenseMatT::OrderT>,
+                                        SolverT>) {
+
+            solver->m_mat_vec =
+                [&](const DenseMatT& in, DenseMatT& out, cudaStream_t stream) {
+                    problem.eval_matvec(in, out, stream);
+                };
+        }
     }
 
     /**
@@ -43,30 +61,84 @@ struct NetwtonSolver
     }
 
     /**
-     * @brief
+     * @brief solve to get Newton direction
      */
     inline void newton_direction(cudaStream_t stream = NULL)
     {
-        // TODO we should refactor (or at least analyze_pattern) once
         problem.grad.multiply(T(-1.f), stream);
 
-        if (solver == Solver::CHOL || solver == Solver::QR) {
-            problem.hess.solve(
-                problem.grad.data(), dir.data(), solver, PermuteMethod::NSTDIS);
-        } else if (solver == Solver::LU) {
-            problem.grad.move(DEVICE, HOST);
-            problem.hess.move(DEVICE, HOST);
-            problem.hess.solve(problem.grad.data(HOST),
-                               dir.data(HOST),
-                               solver,
-                               PermuteMethod::NSTDIS);
+
+        // LU
+        if constexpr (std::is_base_of_v<LUSolver<HessMatT, DenseMatT::OrderT>,
+                                        SolverT>) {
+            problem.grad.move(DEVICE, HOST, stream);
+            problem.hess.move(DEVICE, HOST, stream);
+
+            CPUTimer timer;
+            timer.start();
+
+            solver->pre_solve(problem.rx);
+            solver->solve(problem.grad, dir);
+            timer.stop();
+
+            solve_time += timer.elapsed_millis();
+
+
             dir.move(HOST, DEVICE);
+        }
+
+        // Cholesky or QR
+        if constexpr (std::is_base_of_v<
+                          CholeskySolver<HessMatT, DenseMatT::OrderT>,
+                          SolverT> ||
+                      std::is_base_of_v<QRSolver<HessMatT, DenseMatT::OrderT>,
+                                        SolverT>) {
+
+            GPUTimer timer;
+            timer.start();
+
+            // solver->solve_hl_api(problem.grad, dir);
+
+            solver->pre_solve(problem.rx);
+            solver->solve(problem.grad, dir);
+
+            timer.stop();
+            solve_time += timer.elapsed_millis();
+        }
+
+        //  Iterative Solver (CG/PCG) either matrix-based or matrix-free
+        if constexpr (std::is_base_of_v<CGSolver<T, DenseMatT::OrderT>,
+                                        SolverT>) {
+
+            int r = problem.grad.rows();
+            int c = problem.grad.cols();
+
+            GPUTimer timer;
+            timer.start();
+
+            problem.grad.reshape(r * c, 1);
+            dir.reshape(r * c, 1);
+
+            solver->pre_solve(problem.grad, dir);
+            solver->solve(problem.grad, dir);
+
+            timer.stop();
+            solve_time += timer.elapsed_millis();
+
+            // RXMESH_INFO(
+            //     "Init residual = {}, final residual {}, #Iter taken= {}",
+            //     solver->start_residual(),
+            //     solver->final_residual(),
+            //     solver->iter_taken());
+
+            problem.grad.reshape(r, c);
+            dir.reshape(r, c);
         }
     }
 
 
     /**
-     * @brief
+     * @brief line search
      */
     inline void line_search(const T      s_max        = 1.0,
                             const T      shrink       = 0.8,
@@ -139,6 +211,66 @@ struct NetwtonSolver
                     }
                 });
         }
+    }
+
+
+    /**
+     * @brief apply boundary condition on the system by doing the following to
+     *  the elements corresponding to the boundary
+     * 1) zeroing out off-diagonal elements in the Hessian
+     * 2) setting the diagonal elements to 1
+     * 3) zeroing out the gradient
+     * @param bc is an attribute storing 1/true for boundary condition and
+     * 0/false otherwise.
+     */
+    template <typename bcT>
+    inline void apply_bc(Attribute<bcT, ObjHandleT>& bc)
+    {
+        auto g   = problem.grad;
+        auto H   = problem.hess;
+        int  dim = VariableDim;
+
+        auto& ctx = problem.rx.get_context();
+
+        problem.rx.template for_each<ObjHandleT>(
+            DEVICE,
+            [bc, g, H, dim, ctx] __device__(const ObjHandleT& h) mutable {
+                if (int(bc(h)) == 1) {
+
+                    int h_row_id = ctx.linear_id(h) * dim;
+
+                    // for each row that belongs to this handle
+                    for (int i = 0; i < dim; ++i) {
+                        // TODO the stride here is 1 which might differ
+                        // if we change the stride in the sparse matrix
+                        int row_id = h_row_id + i;
+
+                        int start = H.row_ptr()[row_id];
+                        int stop  = H.row_ptr()[row_id + 1];
+
+                        for (int j = start; j < stop; ++j) {
+                            int col_id = H.col_idx()[j];
+
+                            if (row_id == col_id) {
+                                H.get_val_at(j) = T(1);
+                            } else {
+                                H.get_val_at(j) = T(0);
+
+                                // maintain symmetry
+                                // this may create race condition if col_id
+                                // is also a boundary condition but here all
+                                // threads write 0 so it should be fine
+                                H(col_id, row_id) = T(0);
+                            }
+                        }
+                    }
+
+
+                    for (int i = 0; i < dim; ++i) {
+                        g(h, i) = 0;
+                    }
+                }
+            });
     }
 };
 

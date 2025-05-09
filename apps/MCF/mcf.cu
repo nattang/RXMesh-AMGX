@@ -2,33 +2,32 @@
 // Desbrun, Mathieu, et al "Implicit Fairing of Irregular Meshes using Diffusion
 // and Curvature Flow." SIGGRAPH 1999
 
-#include <omp.h>
-
 #include "gtest/gtest.h"
-#include "rxmesh/attribute.h"
 #include "rxmesh/rxmesh_static.h"
 #include "rxmesh/util/cuda_query.h"
-#include "rxmesh/util/export_tools.h"
-#include "rxmesh/util/import_obj.h"
-#include "rxmesh/util/log.h"
 
 struct arg
 {
-    std::string obj_file_name       = STRINGIFY(INPUT_DIR) "dragon.obj";
+    std::string obj_file_name       = STRINGIFY(INPUT_DIR) "rocker-arm.obj";
     std::string output_folder       = STRINGIFY(OUTPUT_DIR);
     std::string perm_method         = "nstdis";
-    std::string solver              = "chol";
+    std::string solver              = "gmg";
     uint32_t    device_id           = 0;
-    float       time_step           = 0.001;
+    float       time_step           = 10;
     float       cg_tolerance        = 1e-6;
-    uint32_t    max_num_cg_iter     = 1000;
-    bool        use_uniform_laplace = false;
+    float       gmg_tolerance_abs   = 1e-6;
+    float       gmg_tolerance_rel   = 1e-6;
+    uint32_t    max_num_iter        = 100;
+    bool        use_uniform_laplace = true;
+    int         levels              = 3;
     char**      argv;
     int         argc;
 } Arg;
 
 #include "mcf_cg.h"
-#include "mcf_cusolver_chol.cuh"
+#include "mcf_cg_mat_free.h"
+#include "mcf_chol.h"
+#include "mcf_gmg.h"
 
 
 TEST(App, MCF)
@@ -42,11 +41,20 @@ TEST(App, MCF)
     RXMeshStatic rx(Arg.obj_file_name);
 
     ASSERT_TRUE(rx.is_edge_manifold());
-
     if (Arg.solver == "cg") {
         mcf_cg<dataT>(rx);
-    } else {
+    } else if (Arg.solver == "pcg") {
+        mcf_pcg<dataT>(rx);
+    } else if (Arg.solver == "cg_mat_free") {
+        mcf_cg_mat_free<dataT>(rx);
+    } else if (Arg.solver == "pcg_mat_free") {
+        mcf_pcg_mat_free<dataT>(rx);
+    } else if (Arg.solver == "gmg") {
+        mcf_gmg<dataT>(rx);
+    } else if (Arg.solver == "chol") {
         mcf_cusolver_chol<dataT>(rx, string_to_permute_method(Arg.perm_method));
+    } else {
+        RXMESH_ERROR("Unrecognized input solver type: {}", Arg.solver);
     }
 }
 
@@ -70,12 +78,15 @@ int main(int argc, char** argv)
                         " -uniform_laplace:   Use uniform Laplace weights. Default is {} \n"
                         " -dt:                Time step (delta t). Default is {} \n"
                         "                     Hint: should be between (0.001, 1) for cotan Laplace or between (1, 100) for uniform Laplace\n"
-                        " -solver:            Solver to use. Options are CG or Chol. Default is {}\n" 
+                        " -solver:            Solver to use. Options are cg_mat_free, pcg_mat_free, cg, pcg, chol, or gmg. Default is {}\n" 
                         " -eps:               Conjugate gradient tolerance. Default is {}\n"
                         " -perm:              Permutation method for Cholesky factorization. Default is {}\n"
-                        " -max_cg_iter:       Conjugate gradient maximum number of iterations. Default is {}\n"                                            
+                        " -max_iter:          Maximum number of iterations for iterative solvers. Default is {}\n"                                            
+                        " -levels:            Number of levels in the hierarchy, inlcudes the finest level(only for GMG): {} ",
+                        " -tol_abs:           Absolute tolerance for GMG solver: {}",
+                        " -tol_rel:           Relative tolerance for GMG solver: {}",
                         " -device_id:         GPU device ID. Default is {}",
-            Arg.obj_file_name, Arg.output_folder,  (Arg.use_uniform_laplace? "true" : "false"), Arg.time_step, Arg.solver, Arg.cg_tolerance, Arg.perm_method, Arg.max_num_cg_iter, Arg.device_id);
+            Arg.obj_file_name, Arg.output_folder,  (Arg.use_uniform_laplace? "true" : "false"), Arg.time_step, Arg.solver, Arg.cg_tolerance, Arg.perm_method, Arg.max_num_iter,Arg.gmg_tolerance_abs,Arg.gmg_tolerance_rel, Arg.device_id);
             // clang-format on
             exit(EXIT_SUCCESS);
         }
@@ -91,9 +102,9 @@ int main(int argc, char** argv)
         if (cmd_option_exists(argv, argc + argv, "-dt")) {
             Arg.time_step = std::atof(get_cmd_option(argv, argv + argc, "-dt"));
         }
-        if (cmd_option_exists(argv, argc + argv, "-max_cg_iter")) {
-            Arg.max_num_cg_iter =
-                std::atoi(get_cmd_option(argv, argv + argc, "-max_cg_iter"));
+        if (cmd_option_exists(argv, argc + argv, "-max_iter")) {
+            Arg.max_num_iter =
+                std::atoi(get_cmd_option(argv, argv + argc, "-max_iter"));
         }
 
         if (cmd_option_exists(argv, argc + argv, "-eps")) {
@@ -115,17 +126,32 @@ int main(int argc, char** argv)
             Arg.solver =
                 std::string(get_cmd_option(argv, argv + argc, "-solver"));
         }
+        if (cmd_option_exists(argv, argc + argv, "-levels")) {
+            Arg.levels =
+                std::atoi(get_cmd_option(argv, argv + argc, "-levels"));
+        }
+        if (cmd_option_exists(argv, argc + argv, "-tol_abs")) {
+            Arg.gmg_tolerance_abs =
+                std::atof(get_cmd_option(argv, argv + argc, "-tol_abs"));
+        }
+        if (cmd_option_exists(argv, argc + argv, "-tol_rel")) {
+            Arg.gmg_tolerance_rel =
+                std::atof(get_cmd_option(argv, argv + argc, "-tol_rel"));
+        }
     }
 
-    RXMESH_TRACE("input= {}", Arg.obj_file_name);
-    RXMESH_TRACE("output_folder= {}", Arg.output_folder);
-    RXMESH_TRACE("solver= {}", Arg.solver);
-    RXMESH_TRACE("perm= {}", Arg.perm_method);
-    RXMESH_TRACE("max_num_cg_iter= {}", Arg.max_num_cg_iter);
-    RXMESH_TRACE("cg_tolerance= {0:f}", Arg.cg_tolerance);
-    RXMESH_TRACE("use_uniform_laplace= {}", Arg.use_uniform_laplace);
-    RXMESH_TRACE("time_step= {0:f}", Arg.time_step);
-    RXMESH_TRACE("device_id= {}", Arg.device_id);
+    RXMESH_INFO("input= {}", Arg.obj_file_name);
+    RXMESH_INFO("output_folder= {}", Arg.output_folder);
+    RXMESH_INFO("solver= {}", Arg.solver);
+    RXMESH_INFO("perm= {}", Arg.perm_method);
+    RXMESH_INFO("max_num_iter= {}", Arg.max_num_iter);
+    RXMESH_INFO("cg_tolerance= {0:f}", Arg.cg_tolerance);
+    RXMESH_INFO("use_uniform_laplace= {}", Arg.use_uniform_laplace);
+    RXMESH_INFO("time_step= {0:f}", Arg.time_step);
+    RXMESH_INFO("levels= {}", Arg.levels);
+    RXMESH_INFO("gmg_tolerance_rel= {}", Arg.gmg_tolerance_rel);
+    RXMESH_INFO("gmg_tolerance_abs= {}", Arg.gmg_tolerance_abs);
+    RXMESH_INFO("device_id= {}", Arg.device_id);
 
     return RUN_ALL_TESTS();
 }

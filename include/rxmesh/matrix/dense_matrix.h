@@ -26,6 +26,8 @@ struct DenseMatrix
 {
     using IndexT = int;
 
+    static constexpr int OrderT = Order;
+
     template <typename U>
     friend class SparseMatrix;
 
@@ -51,6 +53,21 @@ struct DenseMatrix
                 locationT     location = LOCATION_ALL)
         : m_context(rx.get_context()),
           m_num_rows(num_rows),
+          m_num_cols(num_cols),
+          m_dendescr(NULL),
+          m_h_val(nullptr),
+          m_d_val(nullptr),
+          m_cublas_handle(nullptr),
+          m_user_managed(false)
+    {
+        allocate(location);
+        init_cublas();
+    }
+
+    DenseMatrix(IndexT    num_rows,
+                IndexT    num_cols,
+                locationT location = LOCATION_ALL)
+        : m_num_rows(num_rows),
           m_num_cols(num_cols),
           m_dendescr(NULL),
           m_h_val(nullptr),
@@ -231,7 +248,7 @@ struct DenseMatrix
      * @brief accessing a specific value in the matrix using the row and col
      * index. Can be used on both host and device
      */
-    __host__ __device__ T& operator()(const IndexT row, const IndexT col)
+    __host__ __device__ T& operator()(const IndexT row, const IndexT col = 0)
     {
         assert(row < m_num_rows);
         assert(col < m_num_cols);
@@ -248,7 +265,7 @@ struct DenseMatrix
      * index. Can be used on both host and device
      */
     __host__ __device__ const T& operator()(const IndexT row,
-                                            const IndexT col) const
+                                            const IndexT col = 0) const
     {
         assert(row < m_num_rows);
         assert(col < m_num_cols);
@@ -266,7 +283,8 @@ struct DenseMatrix
      * This can only be used in non user-managed mode
      */
     template <typename HandleT>
-    __host__ __device__ T& operator()(const HandleT handle, const IndexT col)
+    __host__ __device__ T& operator()(const HandleT handle,
+                                      const IndexT  col = 0)
     {
         assert(!m_user_managed);
         return this->operator()(get_row_id(handle), col);
@@ -278,11 +296,46 @@ struct DenseMatrix
      */
     template <typename HandleT>
     __host__ __device__ const T& operator()(const HandleT handle,
-                                            const IndexT  col) const
+                                            const IndexT  col = 0) const
     {
         assert(!m_user_managed);
         return this->operator()(get_row_id(handle), col);
     }
+
+
+    /**
+     * @brief reinterprets the underlying flat storage with a new shape without
+     * copying or modifying the data. The matrix remains in the same memory
+     * layout (row-major or column-major), and element ordering is preserved.
+     * The product of the new_num_rows*new_num_cols should match the product
+     * of the current num_rows*num_cols
+     * @param new_num_rows The new number of rows
+     * @param new_num_cols The new number of columns
+     * @return
+     */
+    __host__ __device__ void reshape(IndexT new_num_rows, IndexT new_num_cols)
+    {
+        assert(m_num_rows * m_num_cols == new_num_rows * new_num_cols &&
+               "Reshape must preserve total number of elements.");
+
+        m_num_rows = new_num_rows;
+        m_num_cols = new_num_cols;
+
+        // make sure that cuSparse knows about these changes
+        // just in case we used this matrix to multiply with a sparse matrix
+        if (std::is_floating_point_v<T> || std::is_same_v<T, int> ||
+            std::is_same_v<T, cuComplex> ||
+            std::is_same_v<T, cuDoubleComplex>) {
+            CUSPARSE_ERROR(cusparseCreateDnMat(&m_dendescr,
+                                               m_num_rows,
+                                               m_num_cols,
+                                               m_num_rows,  // leading dim
+                                               m_d_val,
+                                               cuda_type<T>(),
+                                               CUSPARSE_ORDER_COL));
+        }
+    }
+
 
     /**
      * @brief compute the sum of the absolute value of all elements in the
@@ -293,6 +346,7 @@ struct DenseMatrix
      * @param stream
      * @return
      */
+
     __host__ BaseTypeT<T> abs_sum(cudaStream_t stream = NULL)
     {
         CUBLAS_ERROR(cublasSetStream(m_cublas_handle, stream));
@@ -537,6 +591,73 @@ struct DenseMatrix
 
 
     /**
+     * @brief return the absolute max value in the matrix
+     */
+    __host__ T abs_max(cudaStream_t stream = NULL)
+    {
+        CUBLAS_ERROR(cublasSetStream(m_cublas_handle, stream));
+        if constexpr (!std::is_same_v<T, float> && !std::is_same_v<T, double>) {
+            RXMESH_ERROR(
+                "DenseMatrix::max() only float and double are supported for "
+                "this function!");
+            return T(0);
+        }
+
+        IndexT index;
+        if constexpr (std::is_same_v<T, float>) {
+            CUBLAS_ERROR(cublasIsamax(
+                m_cublas_handle, rows() * cols(), m_d_val, 1, &index));
+        }
+
+        if constexpr (std::is_same_v<T, double>) {
+            CUBLAS_ERROR(cublasIdamax(
+                m_cublas_handle, rows() * cols(), m_d_val, 1, &index));
+        }
+
+        index -= 1;
+
+        T ret = 0;
+
+        CUDA_ERROR(cudaMemcpyAsync(
+            &ret, m_d_val + index, sizeof(T), cudaMemcpyDeviceToHost));
+
+        return std::abs(ret);
+    }
+
+    /**
+     * @brief return the absolute min value in the matrix
+     */
+    __host__ T abs_min(cudaStream_t stream = NULL)
+    {
+        CUBLAS_ERROR(cublasSetStream(m_cublas_handle, stream));
+        if constexpr (!std::is_same_v<T, float> && !std::is_same_v<T, double>) {
+            RXMESH_ERROR(
+                "DenseMatrix::min() only float and double are supported for "
+                "this function!");
+            return T(0);
+        }
+
+        IndexT index;
+        if constexpr (std::is_same_v<T, float>) {
+            CUBLAS_ERROR(cublasIsamin(
+                m_cublas_handle, rows() * cols(), m_d_val, 1, &index));
+        }
+
+        if constexpr (std::is_same_v<T, double>) {
+            CUBLAS_ERROR(cublasIdamin(
+                m_cublas_handle, rows() * cols(), m_d_val, 1, &index));
+        }
+
+        T ret = 0;
+
+        CUDA_ERROR(cudaMemcpyAsync(
+            &ret, m_d_val + index, sizeof(T), cudaMemcpyDeviceToHost));
+
+        return std::abs(ret);
+    }
+
+
+    /**
      * @brief multiply all entries in the dense matrix by a scalar (i.e.,
      * scaling). For complex number, the scalar could be either a complex or
      * real number. The results are computed for the data on the device. Only
@@ -651,14 +772,17 @@ struct DenseMatrix
         IndexT row;
 
         if constexpr (std::is_same_v<HandleT, VertexHandle>) {
+            assert(m_context.vertex_prefix() != nullptr);
             row = m_context.vertex_prefix()[id.first] + id.second;
         }
 
         if constexpr (std::is_same_v<HandleT, EdgeHandle>) {
+            assert(m_context.edge_prefix() != nullptr);
             row = m_context.edge_prefix()[id.first] + id.second;
         }
 
         if constexpr (std::is_same_v<HandleT, FaceHandle>) {
+            assert(m_context.face_prefix() != nullptr);
             row = m_context.face_prefix()[id.first] + id.second;
         }
 
@@ -890,7 +1014,9 @@ struct DenseMatrix
         }
 
         if ((location & LOCATION_ALL) == LOCATION_ALL) {
-            CUSPARSE_ERROR(cusparseDestroyDnMat(m_dendescr));
+            if (m_dendescr) {
+                CUSPARSE_ERROR(cusparseDestroyDnMat(m_dendescr));
+            }
         }
     }
 
@@ -939,13 +1065,17 @@ struct DenseMatrix
      */
     __host__ void init_cublas()
     {
-        CUSPARSE_ERROR(cusparseCreateDnMat(&m_dendescr,
-                                           m_num_rows,
-                                           m_num_cols,
-                                           m_num_rows,  // leading dim
-                                           m_d_val,
-                                           cuda_type<T>(),
-                                           CUSPARSE_ORDER_COL));
+        if (std::is_floating_point_v<T> || std::is_same_v<T, int> ||
+            std::is_same_v<T, cuComplex> ||
+            std::is_same_v<T, cuDoubleComplex>) {
+            CUSPARSE_ERROR(cusparseCreateDnMat(&m_dendescr,
+                                               m_num_rows,
+                                               m_num_cols,
+                                               m_num_rows,  // leading dim
+                                               m_d_val,
+                                               cuda_type<T>(),
+                                               CUSPARSE_ORDER_COL));
+        }
 
         CUBLAS_ERROR(cublasCreate(&m_cublas_handle));
         CUBLAS_ERROR(
@@ -953,7 +1083,7 @@ struct DenseMatrix
     }
 
 
-    const Context        m_context;
+    Context              m_context;
     cusparseDnMatDescr_t m_dendescr;
     cublasHandle_t       m_cublas_handle;
     locationT            m_allocated;

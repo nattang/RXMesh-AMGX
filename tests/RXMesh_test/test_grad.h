@@ -2,147 +2,112 @@
 
 #include "gtest/gtest.h"
 
-#include "rxmesh/diff/scalar.h"
-#include "rxmesh/reduce_handle.h"
 #include "rxmesh/rxmesh_static.h"
 
-template <typename T, int blockThreads>
-__global__ static void smoothing(const rxmesh::Context      context,
-                                 rxmesh::VertexAttribute<T> v_opt_pos,
-                                 rxmesh::VertexAttribute<T> v_pos_grad,
-                                 rxmesh::EdgeAttribute<T>   e_obj_func)
+#include "rxmesh/diff/diff_scalar_problem.h"
+#include "rxmesh/diff/gradient_descent.h"
+#include "rxmesh/diff/newton_solver.h"
+
+
+template <typename ProblemT>
+inline void add_term(ProblemT& problem)
 {
     using namespace rxmesh;
 
-    constexpr int VariableDim    = 3;
-    constexpr int ElementValence = 2;
-    constexpr int NElements      = VariableDim * ElementValence;
-    using ScalarT                = Scalar<T, NElements, false>;
+    problem.template add_term<Op::EV>(
+        [=] __device__(const auto& eh, const auto& iter, auto& objective) {
+            assert(iter.size() == 2);
 
-    auto func = [&](const EdgeHandle& eh, const VertexIterator& iter) {
-        const VertexHandle v0 = iter[0];
-        const VertexHandle v1 = iter[1];
+            using ActiveT = ACTIVE_TYPE(eh);
 
-        Eigen::Vector3<ScalarT> d0;
-        d0[0].val     = v_opt_pos(v0, 0);
-        d0[0].grad[0] = 1;
+            // pos
+            Eigen::Vector3<ActiveT> d0 =
+                iter_val<ActiveT, 3>(eh, iter, objective, 0);
+            Eigen::Vector3<ActiveT> d1 =
+                iter_val<ActiveT, 3>(eh, iter, objective, 1);
 
-        d0[1].val     = v_opt_pos(v0, 1);
-        d0[1].grad[1] = 1;
+            Eigen::Vector3<ActiveT> dist = (d0 - d1);
 
-        d0[2].val     = v_opt_pos(v0, 2);
-        d0[2].grad[2] = 1;
+            ActiveT dist_sq = dist.squaredNorm();
 
-        Eigen::Vector3<ScalarT> d1;
-        d1[0].val     = v_opt_pos(v1, 0);
-        d1[0].grad[3] = 1;
-
-        d1[1].val     = v_opt_pos(v1, 1);
-        d1[1].grad[4] = 1;
-
-        d1[2].val     = v_opt_pos(v1, 2);
-        d1[2].grad[5] = 1;
-
-        Eigen::Vector3<ScalarT> dist = (d0 - d1);
-
-        ScalarT dist_sq = dist.squaredNorm();
-
-        // add the edge contribution to the objective function
-        //::atomicAdd(d_obj_func, dist_sq.val);
-        e_obj_func(eh) = dist_sq.val;
-
-        // add the edge contribution to its two end vertices' grad
-        for (uint16_t vertex = 0; vertex < iter.size(); ++vertex) {
-            for (int local = 0; local < VariableDim; ++local) {
-                ::atomicAdd(
-                    &v_pos_grad(iter[vertex], local),
-                    dist_sq.grad[index_mapping<VariableDim>(vertex, local)]);
-            }
-        }
-    };
-
-    auto block = cooperative_groups::this_thread_block();
-
-    Query<blockThreads> query(context);
-
-    ShmemAllocator shrd_alloc;
-
-    query.dispatch<Op::EV>(block, shrd_alloc, func);
+            return dist_sq;
+        });
 }
 
-template <typename T>
-void take_step(const rxmesh::RXMeshStatic&       rx,
-               rxmesh::VertexAttribute<T>&       v_opt_pos,
-               const rxmesh::VertexAttribute<T>& v_pos_grad,
-               const float                       learning_rate)
-{
-    using namespace rxmesh;
-    rx.for_each_vertex(DEVICE, [=] __device__(const VertexHandle& vh) {
-        for (int i = 0; i < 3; ++i) {
-            v_opt_pos(vh, i) -= learning_rate * v_pos_grad(vh, i);
-        }
-    });
-}
-
-TEST(DiffAttribute, SmoothingGradDescent)
+TEST(Diff, SmoothingNewton)
 {
     using namespace rxmesh;
 
-    // RXMeshStatic rx(STRINGIFY(INPUT_DIR) "bunnyhead.obj");
-    RXMeshStatic rx(rxmesh_args.obj_file_name);
+    RXMeshStatic rx(STRINGIFY(INPUT_DIR) "bunnyhead.obj");
+    // RXMeshStatic rx(rxmesh_args.obj_file_name);
 
-    auto v_opt_pos = *rx.add_vertex_attribute<float>("vPos", 3);
+    using T = float;
 
-    auto v_pos_grad = *rx.add_vertex_attribute<float>("vGradPos", 3);
+    constexpr int VariableDim = 3;
+
+    using ProblemT = DiffScalarProblem<T, VariableDim, VertexHandle, true>;
+
+    ProblemT problem(rx);
 
     auto v_input_pos = *rx.get_input_vertex_coordinates();
 
-    auto e_obj_func = *rx.add_edge_attribute<float>("eObjFunc", 1);
+    problem.objective->copy_from(v_input_pos, DEVICE, DEVICE);
 
-    v_opt_pos.copy_from(v_input_pos, DEVICE, DEVICE);
+    add_term(problem);
 
-    constexpr uint32_t blockThreads = 256;
 
-    float learning_rate = 0.01;
+    using HessMatT = typename ProblemT::HessMatT;
+
+    LUSolver<HessMatT, ProblemT::DenseMatT::OrderT> solver(&problem.hess);
+
+    NetwtonSolver newton(problem, &solver);
 
     int num_iterations = 100;
 
-    LaunchBox<blockThreads> lb;
-    rx.prepare_launch_box({Op::EV}, lb, (void*)smoothing<float, blockThreads>);
-
-    EdgeReduceHandle<float> obj_func(e_obj_func);
+    T convergence_eps = 1e-2;
 
     GPUTimer timer;
     timer.start();
 
     for (int iter = 0; iter < num_iterations; ++iter) {
 
-        smoothing<float, blockThreads>
-            <<<lb.blocks, lb.num_threads, lb.smem_bytes_dyn>>>(
-                rx.get_context(), v_opt_pos, v_pos_grad, e_obj_func);
+        problem.eval_terms();
 
-        float energy = obj_func.reduce(e_obj_func, cub::Sum(), 0);
 
-        if (iter % 10 == 0) {
-            RXMESH_INFO("Iteration = {}: Energy = {}", iter, energy);
+        float energy = problem.get_current_loss();
+
+        RXMESH_INFO("Iteration = {}: Energy = {}", iter, energy);
+
+
+        newton.newton_direction();
+
+        RXMESH_INFO("newton.dir.norm2() = {}", newton.dir.norm2());
+        RXMESH_INFO("problem.grad.norm2() = {}", problem.grad.norm2());
+
+        if (0.5f * problem.grad.dot(newton.dir) < convergence_eps) {
+            break;
         }
 
-
-        take_step(rx, v_opt_pos, v_pos_grad, learning_rate);
-
-        v_pos_grad.reset(0, DEVICE);
+        newton.line_search();
     }
     timer.stop();
 
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    std::cout << "\nSmoothing RXMesh: " << timer.elapsed_millis() << " (ms),"
-              << timer.elapsed_millis() / float(num_iterations)
+    std::cout << "\nSmoothing Newton RXMesh: " << timer.elapsed_millis()
+              << " (ms)," << timer.elapsed_millis() / float(num_iterations)
               << " ms per iteration\n";
 
-#if USE_POLYSCOPE
-    v_opt_pos.move(DEVICE, HOST);
-    rx.get_polyscope_mesh()->updateVertexPositions(v_opt_pos);
-    //polyscope::show();
-#endif
+    // so newton method on this function should lead to a vertex position that
+    // is just zero since the function is quadratic
+
+    problem.objective->move(DEVICE, HOST);
+
+    T f = (*problem.objective)(VertexHandle(0, 0), 0);
+
+    rx.for_each_vertex(HOST, [&](const VertexHandle vh) {
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_NEAR((*problem.objective)(vh, 0), f, 1e-3);
+        }
+    });
 }

@@ -7,91 +7,6 @@
 
 namespace rxmesh {
 
-/**
- * @brief Helper struct to get the iterator type based on a query operation
- */
-template <Op op>
-struct IteratorType
-{
-    using type = void;
-};
-
-template <>
-struct IteratorType<Op::VV>
-{
-    using type = VertexIterator;
-};
-
-template <>
-struct IteratorType<Op::VE>
-{
-    using type = EdgeIterator;
-};
-
-template <>
-struct IteratorType<Op::VF>
-{
-    using type = FaceIterator;
-};
-
-
-template <>
-struct IteratorType<Op::EV>
-{
-    using type = VertexIterator;
-};
-
-template <>
-struct IteratorType<Op::EVDiamond>
-{
-    using type = VertexIterator;
-};
-
-template <>
-struct IteratorType<Op::EE>
-{
-    using type = EdgeIterator;
-};
-
-template <>
-struct IteratorType<Op::EF>
-{
-    using type = FaceIterator;
-};
-
-
-template <>
-struct IteratorType<Op::FV>
-{
-    using type = VertexIterator;
-};
-
-template <>
-struct IteratorType<Op::FE>
-{
-    using type = EdgeIterator;
-};
-
-template <>
-struct IteratorType<Op::FF>
-{
-    using type = FaceIterator;
-};
-
-
-/**
- * @brief 
- * @tparam T 
- * @tparam DiffHandleT 
- * @tparam IteratorT 
- * @tparam PassiveT 
- * @tparam VariableDim 
- * @param handle 
- * @param iter 
- * @param attr 
- * @param index 
- * @return 
- */
 template <typename T,
           int VariableDim,
           typename DiffHandleT,
@@ -123,6 +38,36 @@ __device__ __inline__ Eigen::Vector<T, VariableDim> iter_val(
     if constexpr (DiffHandleT::IsActive) {
         for (int j = 0; j < VariableDim; ++j) {
             ret[j].grad[index * VariableDim + j] = 1;
+        }
+    }
+
+    return ret;
+}
+
+
+template <typename T, int VariableDim, typename DiffHandleT, typename PassiveT>
+__device__ __inline__ Eigen::Vector<T, VariableDim> iter_val(
+    const DiffHandleT&                                       handle,
+    const Attribute<PassiveT, typename DiffHandleT::Handle>& attr)
+{
+    Eigen::Vector<T, VariableDim> ret;
+
+    assert(VariableDim == attr.get_num_attributes());
+
+
+    // val
+    for (int j = 0; j < VariableDim; ++j) {
+        if constexpr (DiffHandleT::IsActive) {
+            ret[j].val = attr(handle, j);
+        } else {
+            ret[j] = attr(handle, j);
+        }
+    }
+
+    // init grad
+    if constexpr (DiffHandleT::IsActive) {
+        for (int j = 0; j < VariableDim; ++j) {
+            ret[j].grad[j] = 1;
         }
     }
 

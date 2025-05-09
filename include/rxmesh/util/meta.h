@@ -16,27 +16,18 @@ struct FunctionTraits : public FunctionTraits<decltype(&T::operator())>
 {
 };
 
-/**
- * @brief specialization for pointers to member function
- */
-template <typename ClassType, typename ReturnType, typename... Args>
-struct FunctionTraits<ReturnType (ClassType::*)(Args...) const>
-{
-    /**
-     * @brief arity is the number of arguments.
-     */
-    enum
-    {
-        arity = sizeof...(Args)
-    };
 
-    typedef ReturnType result_type;
+template <typename ReturnType, typename... Args>
+struct FunctionTraitsBase
+{
+    static constexpr std::size_t arity = sizeof...(Args);
+    using result_type                  = ReturnType;
 
     /**
      * @brief the i-th argument is equivalent to the i-th tuple element of a
      * tuple composed of those arguments.
      */
-    template <size_t i>
+    template <std::size_t i>
     struct arg
     {
         using type_rc =
@@ -50,6 +41,20 @@ struct FunctionTraits<ReturnType (ClassType::*)(Args...) const>
     };
 };
 
+
+// const-qualified operator()
+template <typename ClassType, typename ReturnType, typename... Args>
+struct FunctionTraits<ReturnType (ClassType::*)(Args...) const>
+    : FunctionTraitsBase<ReturnType, Args...>
+{
+};
+
+// non-const operator() (for mutable lambdas)
+template <typename ClassType, typename ReturnType, typename... Args>
+struct FunctionTraits<ReturnType (ClassType::*)(Args...)>
+    : FunctionTraitsBase<ReturnType, Args...>
+{
+};
 }  // namespace detail
 
 
@@ -88,9 +93,10 @@ namespace detail {
  * Primary template: Default case where T::Passive does not exist
  */
 
-template <typename, typename = void>
+template <typename T, typename = void>
 struct is_scalar : std::false_type
 {
+    using type = T;
 };
 
 /**
@@ -99,6 +105,7 @@ struct is_scalar : std::false_type
 template <typename T>
 struct is_scalar<T, std::void_t<typename T::PassiveType>> : std::true_type
 {
+    using type = typename T::PassiveType;
 };
 }  // namespace detail
 
@@ -116,7 +123,7 @@ inline constexpr bool is_scalar_v = detail::is_scalar<T>::value;
  * (e.g., float, double), then the returned type is T itself.
  */
 template <typename T>
-using PassiveType =
-    typename std::conditional<is_scalar_v<T>, typename T::PassiveType, T>::type;
+using PassiveType = typename detail::is_scalar<T>::type;
+
 
 }  // namespace rxmesh
